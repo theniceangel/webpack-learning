@@ -1,6 +1,6 @@
 # LoaderRunner
 
-绝大多数人都在使用 webpack 作为构建工具。那么 `loader` 作为处理各种资源的工具，大家肯定也不会陌生。很多人没写过 loader，但是都对 loader 的具体怎么写，怎样执行的一无所知。那么本文就对
+绝大多数人都在使用 webpack 作为构建工具。那么 `loader` 作为处理各种资源的工具，大家肯定也不会陌生。很多人没写过 loader，但是都对 loader 的具体怎么写，怎样执行的一无所知。那么本文就对 `3.0.0` 版本做一个全方位的揭秘。
 
 ## loader
 
@@ -592,7 +592,7 @@ module.exports = function(content, map, meta) {
 
 那么 runLoaders 的整体执行流程如下图：
 
-![loader 执行图]()
+![loader 执行图](https://raw.githubusercontent.com/theniceangel/webpack-learning/master/images/loader.png)
 
 ## iteratePitchingLoaders 内的 runSyncOrAsync
 
