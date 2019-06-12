@@ -204,11 +204,11 @@ exports.runLoaders = function runLoaders(options, callback) {
   }
   ```
 
-  loader 对象上会新增很多属性，比如 `normal` 是对应 loader 暴露出来的函数，`pitch` 是 loader 的 pitch 函数。`raw` 也是 loader 暴露出来的属性用来控制是否将资源转成 Buffer 格式。`pitchExecuted` 与 `normalExecuted` 用来标记当前 loader 的 pitch 与 normal 是否执行，在 `iteratePitchingLoaders` 内部是用来控制 `loaderContext.loaderindex` 的变化。
+  loader 对象上会新增很多属性，比如 `normal` 是对应 loader 暴露出来的函数，`pitch` 是 loader 的 pitch 函数。`raw` 也是 loader 暴露出来的属性用来控制是否将资源转成 Buffer 格式。`pitchExecuted` 与 `normalExecuted` 用来标记当前 loader 的 pitch 与 normal 是否执行，在 `iteratePitchingLoaders` 内部是用来控制 `loaderContext.loaderIndex` 的变化。
 
 2. **loaderContext的处理**
 
-  这个变量非常重要，它的 `loaderIndex` 属性控制了所有 loaders 的 pitch 与 normal 执行的所有流程， `async` 是一个闭包函数，它是实现异步 loader 的关键，这是后话。 `callback` 也是一个闭包函数，不过它不仅能实现同步 loader，还能实行异步 loader，同时还支持在 loader 的函数里面返回一个 promise。
+  这个变量非常重要，它的 `loaderIndex` 属性控制了所有 loaders 的 pitch 与 normal 执行的所有流程， `async` 是一个闭包函数，它是实现异步 loader 的关键，这是后话。 `callback` 也是一个闭包函数，不过它不仅能实现同步 loader，还能实现异步 loader。
 
 3. **getter/setter**
 
@@ -309,7 +309,7 @@ module.exports = {
 |- a-loader normal execution
 ```
 
-就具体的原来分析来看。首先，`loaderContext.loaderIndex` 是从 0 开始递增，说明 pitch 的执行就是从左向右的顺序。接着就会走到 `loadLoader` 的逻辑，这个逻辑就是加载 loader 函数。
+从原来分析来看：首先，`loaderContext.loaderIndex` 是从 0 开始递增，说明 pitch 的执行就是从左向右的顺序。接着就会走到 `loadLoader` 的逻辑，这个逻辑就是加载 loader 模块。
 
 ```js
 module.exports = function loadLoader(loader, callback) {
@@ -393,6 +393,7 @@ loadLoader(currentLoaderObject, function(err) {
 if(loaderContext.loaderIndex >= loaderContext.loaders.length)
     return processResource(options, loaderContext, callback);
 
+// 开始读入资源文件
 function processResource(options, loaderContext, callback) {
 	// set loader index to last loader
 	loaderContext.loaderIndex = loaderContext.loaders.length - 1;
@@ -416,6 +417,7 @@ processResource 的执行，代表着 pitch 的执行都完成了，开始读入
 ```js
 loaderContext.loaderIndex = loaderContext.loaders.length - 1;
 ```
+
 先将 loaderIndex 设置为最后一个，即 normal 的执行是逆向的。接着调用 `addDependency` 将当前资源文件的路径推入 `fileDependencies` 数组，也就是在整个资源文件被 loaders 处理的过程当中，都能拿到这个 `fileDependencies` 数组的数据，进而开始调用 `iterateNormalLoaders` 来执行 loaders 的 normal 函数。我们来看下 `iterateNormalLoaders` 函数的执行。
 
 ## iterateNormalLoaders
@@ -567,6 +569,9 @@ module.exports = function(content, map, meta) {
 module.exports = function(content, map, meta) {
   return someSyncOperation(content);
 };
+module.exports = function(content, map, meta) {
+  return this.callback(null, content);
+};
 ```
 
 如果是同步 loader，那么 `isSync` 为 true，这里判断如果 `result` 是一个 promise，那么等这个 promise 完成之后，调用 callback，否则就调用 callback。
@@ -575,8 +580,11 @@ module.exports = function(content, map, meta) {
 
 ```js
 module.exports = function(content, map, meta) {
-  this.callback(null, someSyncOperation(content), map, meta);
-  return; // always return undefined when calling callback()
+  var callback = this.async();
+  someAsyncOperation(content, function(err, result) {
+    if (err) return callback(err);
+    callback(null, result, map, meta);
+  });
 };
 
 module.exports = function(content, map, meta) {
