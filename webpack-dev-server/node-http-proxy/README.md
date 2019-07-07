@@ -292,3 +292,5 @@ function createRightProxy(type) {
 ## 总结
 
 所以从库的内部交互来看，代理服务器在客户端以及目标服务器之间充当一个媒介的作用。它能管理客户端发送给目标服务器的 request、以及目标服务器返回给客户端的 response。内部提供了很多灵活的配置项，来实现不同的代理定制化需求。看完这个库之后，那么是时候分析 [http-proxy-middleware](https://github.com/chimurai/http-proxy-middleware) 这个库，看这个 middleware 到底是基于这个库做了哪些扩展。
+
+[http-proxy-middleware 源码分析](https://github.com/theniceangel/webpack-learning/tree/master/webpack-dev-server/http-proxy-middleware)
