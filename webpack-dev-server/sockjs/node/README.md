@@ -450,4 +450,525 @@ prefix 是 `/echo`，也就是说所有以 `/echo` 开头的请求才会被 sock
 
     那么 sockjs-client 拿到这些信息之后就能做响应的处理，换句话来说，服务端也能通过 /info 接口返回数据来控制客户端的行为，正如上面 [sockjs-protocol](https://sockjs.github.io/sockjs-protocol/sockjs-protocol-0.3.3.html#section-26) 描述的。
 
+3. **/websocket 请求**
 
+    `http://localhost:9999/echo/info` 请求返回之后，`sockjs-client` 会调用 `_connect` 方法，开始真正的选择一种 tranport 来进行通信，首先是选择 Websocket 方案。如果 Websocket transport 会先给服务端发送 `ws://localhost:9999/echo/852/vcpouwun/websocket` 请求来升级协议，其中 `852` 和 `vcpouwun` 都是随机生成的，服务端会用到他们用在 session 连接上。那么上面 `for (const row of dispatcher)` 的迭代命中的 row 就是 `['GET', [
+      '/^\/echo\/([^\/.]+)\/([^\/.]+)\/websocket[\/]?$/',
+      'server',
+      'session'
+    ], [websocket_check, sockjs_websocket]]`，所以会走到 `websocket_check`、`sockjs_websocket` 三个中间件，并且 `req.session` 就是 `vcpouwun`，`req.server` 就是 `852`
+
+    ```js
+    // middleware.js
+    websocket_check(req, _socket, _head, next) {
+      if (!FayeWebsocket.isWebSocket(req)) {
+        return next({
+          status: 400,
+          message: 'Not a valid websocket request'
+        });
+      }
+      next();
+    },
+
+    // lib/transport/websocket.js
+    function sockjs_websocket(req, socket, head, next) {
+      const ws = new FayeWebsocket(req, socket, head, null, this.options.faye_server_options);
+      ws.once('open', () => {
+        // websockets possess no session_id
+        Session.registerNoSession(req, this, new WebSocketReceiver(ws, socket));
+      });
+      next();
+    }
+    ```
+
+    `websocket_check` 是校验这次请求是不是合法 websocket 请求。
+
+    `sockjs_websocket` 函数的作用是实例化一个 websocket 服务器，内部使用的是 [faye-websocket](https://github.com/faye/faye-websocket-node)，这是一个比较标准的 Websocket 实现，并且通过 `Session.registerNoSession` 方法将这次请求加入 session 当中。Session 类抽象了客户端与服务端请求连接的行为，在客户端发起请求之后，服务端是通过 Session 实例来记录这次请求的行为。`registerNoSession` 方法接收三个参数，一个是 httpServer 的 `req`，第二个是 `sockjs-node` 的实例，第三个是 WebSocketReceiver 实例。先看下 `WebSocketReceiver` 的定义。
+
+    ```js
+    class WebSocketReceiver extends BaseReceiver {
+      constructor(ws, socket) {
+        super(socket);
+        debug('new connection');
+        this.protocol = 'websocket';
+        this.ws = ws;
+        try {
+          socket.setKeepAlive(true, 5000);
+        } catch (x) {
+          // intentionally empty
+        }
+        this.ws.once('close', this.abort);
+        this.ws.on('message', m => this.didMessage(m.data));
+        this.heartbeatTimeout = this.heartbeatTimeout.bind(this);
+      }
+
+      tearDown() {
+        if (this.ws) {
+          this.ws.removeEventListener('close', this.abort);
+        }
+        super.tearDown();
+      }
+
+      didMessage(payload) {
+        debug('message');
+        if (this.ws && this.session && payload.length > 0) {
+          let message;
+          try {
+            message = JSON.parse(payload);
+          } catch (x) {
+            return this.close(3000, 'Broken framing.');
+          }
+          if (payload[0] === '[') {
+            message.forEach(msg => this.session.didMessage(msg));
+          } else {
+            this.session.didMessage(message);
+          }
+        }
+      }
+
+      sendFrame(payload) {
+        debug('send');
+        if (this.ws) {
+          try {
+            this.ws.send(payload);
+            return true;
+          } catch (x) {
+            // intentionally empty
+          }
+        }
+        return false;
+      }
+
+      close(status = 1000, reason = 'Normal closure') {
+        super.close(status, reason);
+        if (this.ws) {
+          try {
+            this.ws.close(status, reason, false);
+          } catch (x) {
+            // intentionally empty
+          }
+        }
+        this.ws = null;
+      }
+
+      heartbeat() {
+        const supportsHeartbeats = this.ws.ping(null, () => clearTimeout(this.hto_ref));
+
+        if (supportsHeartbeats) {
+          this.hto_ref = setTimeout(this.heartbeatTimeout, 10000);
+        } else {
+          super.heartbeat();
+        }
+      }
+
+      heartbeatTimeout() {
+        if (this.session) {
+          this.session.close(3000, 'No response from heartbeat');
+        }
+      }
+    }
+
+    // BaseReceiver
+    class BaseReceiver {
+      constructor(socket) {
+        this.abort = this.abort.bind(this);
+        this.socket = socket;
+        this.socket.on('close', this.abort);
+        this.socket.on('end', this.abort);
+      }
+
+      tearDown() {
+        if (!this.socket) {
+          return;
+        }
+        debug('tearDown', this.session && this.session.id);
+        this.socket.removeListener('close', this.abort);
+        this.socket.removeListener('end', this.abort);
+        this.socket = null;
+      }
+
+      abort() {
+        debug('abort', this.session && this.session.id);
+        this.delay_disconnect = false;
+        this.close();
+      }
+
+      close() {
+        debug('close', this.session && this.session.id);
+        this.tearDown();
+        if (this.session) {
+          this.session.unregister();
+        }
+      }
+
+      sendBulk(messages) {
+        const q_msgs = messages.map(m => utils.quote(m)).join(',');
+        return this.sendFrame(`a[${q_msgs}]`);
+      }
+
+      heartbeat() {
+        return this.sendFrame('h');
+      }
+    }
+    ```
+
+    WebSocketReceiver 继承于 BaseReceiver 类，BaseReceiver 是管理服务端向客户端推送消息。不管是 `sendBulk` 还是 `heartbeat` 都是调用 `sendFrame` 来给客户端推送信息。继承了 BaseReceiver 类的子类都应该事先 `sendFrame` 方法，就如上面 WebSocketReceiver 的 `sendFrame` 函数内部就是拿到 `faye-websocket` 这个实例并且调用 send 方法，这个时候客户端就能接收到消息了。
+
+    再回到 `Session.registerNoSession`
+
+    ```js
+    const MAP = new Map();
+
+    class Session {
+      static bySessionId(session_id) {
+        if (!session_id) {
+          return null;
+        }
+        return MAP.get(session_id) || null;
+      }
+
+      static _register(req, server, session_id, receiver) {
+        let session = Session.bySessionId(session_id);
+        if (!session) {
+          debug('create new session', session_id);
+          session = new Session(session_id, server);
+        }
+        session.register(req, receiver);
+        return session;
+      }
+
+      static register(req, server, receiver) {
+        debug('static register', req.session);
+        return Session._register(req, server, req.session, receiver);
+      }
+
+      static registerNoSession(req, server, receiver) {
+        debug('static registerNoSession');
+        return Session._register(req, server, undefined, receiver);
+      }
+
+      constructor(session_id, server) {
+        this.session_id = session_id;
+        this.heartbeat_delay = server.options.heartbeat_delay;
+        this.disconnect_delay = server.options.disconnect_delay;
+        this.prefix = server.options.prefix;
+        this.send_buffer = [];
+        this.is_closing = false;
+        this.readyState = Transport.CONNECTING;
+        debug('readyState', 'CONNECTING', this.session_id);
+        if (this.session_id) {
+          MAP.set(this.session_id, this);
+        }
+        this.didTimeout = this.didTimeout.bind(this);
+        this.to_tref = setTimeout(this.didTimeout, this.disconnect_delay);
+        this.connection = new SockJSConnection(this);
+        this.emit_open = () => {
+          this.emit_open = null;
+          server.emit('connection', this.connection);
+        };
+      }
+
+      get id() {
+        return this.session_id;
+      }
+
+      register(req, recv) {
+        if (this.recv) {
+          recv.sendFrame(closeFrame(2010, 'Another connection still open'));
+          recv.close();
+          return;
+        }
+        if (this.to_tref) {
+          clearTimeout(this.to_tref);
+          this.to_tref = null;
+        }
+        if (this.readyState === Transport.CLOSING) {
+          this.flushToRecv(recv);
+          recv.sendFrame(this.close_frame);
+          recv.close();
+          this.to_tref = setTimeout(this.didTimeout, this.disconnect_delay);
+          return;
+        }
+        // Registering. From now on 'unregister' is responsible for
+        // setting the timer.
+        this.recv = recv;
+        this.recv.session = this;
+
+        // Save parameters from request
+        this.decorateConnection(req);
+
+        // first, send the open frame
+        if (this.readyState === Transport.CONNECTING) {
+          this.recv.sendFrame('o');
+          this.readyState = Transport.OPEN;
+          debug('readyState', 'OPEN', this.session_id);
+          // Emit the open event, but not right now
+          process.nextTick(this.emit_open);
+        }
+
+        // At this point the transport might have gotten away (jsonp).
+        if (!this.recv) {
+          return;
+        }
+        this.tryFlush();
+      }
+
+      decorateConnection(req) {
+        Session.decorateConnection(req, this.connection, this.recv);
+      }
+
+      static decorateConnection(req, connection, recv) {
+        let socket = recv.socket;
+        if (!socket) {
+          socket = recv.response.socket;
+        }
+        // Store the last known address.
+        let remoteAddress, remotePort, address;
+        try {
+          remoteAddress = socket.remoteAddress;
+          remotePort = socket.remotePort;
+          address = socket.address();
+        } catch (x) {
+          // intentionally empty
+        }
+
+        if (remoteAddress) {
+          // All-or-nothing
+          connection.remoteAddress = remoteAddress;
+          connection.remotePort = remotePort;
+          connection.address = address;
+        }
+
+        connection.url = req.url;
+        connection.pathname = req.pathname;
+        connection.protocol = recv.protocol;
+
+        const headers = {};
+        const allowedHeaders = [
+          'referer',
+          'x-client-ip',
+          'x-forwarded-for',
+          'x-cluster-client-ip',
+          'via',
+          'x-real-ip',
+          'x-forwarded-proto',
+          'x-ssl',
+          'dnt',
+          'host',
+          'user-agent',
+          'accept-language'
+        ];
+        for (const key of allowedHeaders) {
+          if (req.headers[key]) {
+            headers[key] = req.headers[key];
+          }
+        }
+
+        if (headers) {
+          connection.headers = headers;
+        }
+      }
+
+      unregister() {
+        debug('unregister', this.session_id);
+        const delay = this.recv.delay_disconnect;
+        this.recv.session = null;
+        this.recv = null;
+        if (this.to_tref) {
+          clearTimeout(this.to_tref);
+        }
+
+        if (delay) {
+          debug('delay timeout', this.session_id);
+          this.to_tref = setTimeout(this.didTimeout, this.disconnect_delay);
+        } else {
+          debug('immediate timeout', this.session_id);
+          this.didTimeout();
+        }
+      }
+
+      flushToRecv(recv) {
+        if (this.send_buffer.length > 0) {
+          const sb = this.send_buffer;
+          this.send_buffer = [];
+          recv.sendBulk(sb);
+          return true;
+        }
+        return false;
+      }
+
+      tryFlush() {
+        if (!this.flushToRecv(this.recv) || !this.to_tref) {
+          if (this.to_tref) {
+            clearTimeout(this.to_tref);
+          }
+          const x = () => {
+            if (this.recv) {
+              this.to_tref = setTimeout(x, this.heartbeat_delay);
+              this.recv.heartbeat();
+            }
+          };
+          this.to_tref = setTimeout(x, this.heartbeat_delay);
+        }
+      }
+
+      didTimeout() {
+        if (this.to_tref) {
+          clearTimeout(this.to_tref);
+          this.to_tref = null;
+        }
+        if (
+          this.readyState !== Transport.CONNECTING &&
+          this.readyState !== Transport.OPEN &&
+          this.readyState !== Transport.CLOSING
+        ) {
+          throw new Error('INVALID_STATE_ERR');
+        }
+        if (this.recv) {
+          throw new Error('RECV_STILL_THERE');
+        }
+        debug('readyState', 'CLOSED', this.session_id);
+        this.readyState = Transport.CLOSED;
+        this.connection.push(null);
+        this.connection = null;
+        if (this.session_id) {
+          MAP.delete(this.session_id);
+          debug('delete session', this.session_id, MAP.size);
+          this.session_id = null;
+        }
+      }
+
+      didMessage(payload) {
+        if (this.readyState === Transport.OPEN) {
+          this.connection.push(payload);
+        }
+      }
+
+      send(payload) {
+        if (this.readyState !== Transport.OPEN) {
+          return false;
+        }
+        this.send_buffer.push(payload);
+        if (this.recv) {
+          this.tryFlush();
+        }
+        return true;
+      }
+
+      close(status = 1000, reason = 'Normal closure') {
+        debug('close', status, reason);
+        if (this.readyState !== Transport.OPEN) {
+          return false;
+        }
+        this.readyState = Transport.CLOSING;
+        debug('readyState', 'CLOSING', this.session_id);
+        this.close_frame = closeFrame(status, reason);
+        if (this.recv) {
+          // Go away. sendFrame can trigger close which can
+          // trigger unregister. Make sure this.recv is not null.
+          this.recv.sendFrame(this.close_frame);
+          if (this.recv) {
+            this.recv.close();
+          }
+          if (this.recv) {
+            this.unregister();
+          }
+        }
+        return true;
+      }
+    }
+    ```
+
+    `session.js` 模块内部有个 MAP 对象来保存所有请求的 session 实例，它 的 key 就是上文说到的 `vcpouwun`。
+
+    Session 类上的静态方法 `registerNoSession` 内部会调用静态方法 `_register` 并且第三个参数传 undefined，也就是对于 websocket 来说，请求没必要缓存在 Map 当中，最后会走到 `session = new Session(session_id, server);` 新创建一个 session。
+
+    ```js
+    constructor(session_id, server) {
+      this.session_id = session_id;
+      this.heartbeat_delay = server.options.heartbeat_delay;
+      this.disconnect_delay = server.options.disconnect_delay;
+      this.prefix = server.options.prefix;
+      this.send_buffer = [];
+      this.is_closing = false;
+      this.readyState = Transport.CONNECTING;
+      debug('readyState', 'CONNECTING', this.session_id);
+      if (this.session_id) {
+        MAP.set(this.session_id, this);
+      }
+      this.didTimeout = this.didTimeout.bind(this);
+      this.to_tref = setTimeout(this.didTimeout, this.disconnect_delay);
+      this.connection = new SockJSConnection(this);
+      this.emit_open = () => {
+        this.emit_open = null;
+        server.emit('connection', this.connection);
+      };
+    }
+    ```
+
+    session 上有很多属性与方法，`heartbeat_delay` 表示服务端给客户端发心跳包的间隔，`disconnect_delay` 表示连接超时时间，`send_buffer` 用来缓存服务端给客户端的消息，在调用 `tryFlush` 的时候 `flushToRecv`，在 `flushToRecv` 的内部是获取到对应的 Receiver 实例，比如 Websocket 请求就是 WebSocketReceiver 实例，调用 `sendBulk` 最后调用 `sendFrame` 来将消息 flush 给客户端。
+
+    `SockJSConnection` 类是抽象出来的连接类，并且作为第三方使用者，监听 `sockjs-node` 的 connection 事件之后，回调函数的第一个参数是 SockJSConnection 实例.
+
+    ```js
+    const sockjs_echo = sockjs.createServer(sockjs_opts);
+
+    sockjs_echo.on('connection', function(conn) {
+      conn.on('data', function(message) {
+        conn.write(message);
+      });
+    });
+    ```
+
+    上述的 conn 就是 SockJSConnection 实例。调用 `conn.write(message)` 就是给客户端推送消息。SockJSConnection 的实现如下：
+
+    ```js
+    class SockJSConnection extends stream.Duplex {
+      constructor(session) {
+        super({ decodeStrings: false, encoding: 'utf8', readableObjectMode: true });
+        this._session = session;
+        this.id = uuid();
+        this.headers = {};
+        this.prefix = this._session.prefix;
+        debug('new connection', this.id, this.prefix);
+      }
+
+      toString() {
+        return `<SockJSConnection ${this.id}>`;
+      }
+
+      _write(chunk, encoding, callback) {
+        if (Buffer.isBuffer(chunk)) {
+          chunk = chunk.toString();
+        }
+        this._session.send(chunk);
+        callback();
+      }
+
+      _read() {}
+
+      end(chunk, encoding, callback) {
+        super.end(chunk, encoding, callback);
+        this.close();
+      }
+
+      close(code, reason) {
+        debug('close', code, reason);
+        return this._session.close(code, reason);
+      }
+
+      get readyState() {
+        return this._session.readyState;
+      }
+    ```
+
+    SockJSConnection 继承了双工流，如果你执行 `conn.write(msg)`，会走到 `this._write()`，在重写的 _write 方法里面，会调用 `  this._session.send(chunk)`，send 方法里面会调用 `tryFlush` 这样便可以给客户端发送消息。
+
+
+## 总结
+
+上述只是分析了一下 Websocket tranport 的方式。那么理一下 `sockjs-node` 与 `sockjs-client` 的整体交互流程。
+
+1. client 先发送一个 `/info` 请求给 server，来获取 info 信息。
+2. 接着 client 内部调用 `_connect` 方法建立 `Websocket` 连接，请求的格式类似于 `/{prefix}/{server}/{session}/websocket`
+3. 服务端接收请求之后，升级为 Websocket 协议，接着实例化 WebSocketReceiver，内部会实例化 `faye_websocket`，并且传给 Session，Session 上会保存着 SockJSConnection 实例，并且 server 会触发 `connection` 事件将 sockJSConnection 作为参数传给回调函数，那么作为使用方就能通过 sockJSConnection 实例，调用 write 方法触发 `session.send` 进而沟通 `websocket` 给客户端推送消息。
