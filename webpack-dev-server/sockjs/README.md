@@ -4,5 +4,5 @@ webpackDevServer 3.7.1 版本是依赖 SockJs 来实现 hotReload、liveLoad 等
 
 这个协议的约定，会伴随着阅读两个库的源码而具体分析。
 
-第一篇：[sockjs-client 的源码分析]()
-第二篇：[sockjs-node 的源码分析]()
+第一篇：[sockjs-client 的源码分析](https://github.com/theniceangel/webpack-learning/issues/7)
+第二篇：[sockjs-node 的源码分析](https://github.com/theniceangel/webpack-learning/issues/8)
